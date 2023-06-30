@@ -27,7 +27,7 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, signal_handler);
 
-	res = pthread_create(&accept_read_th, NULL, accept_recv_loop, NULL);
+	res = pthread_create(&accept_read_th, NULL, recvmsg_loop, NULL);
 	if (res < 0) {
 		perror("pthread_create()");
 		graceful_shutdown();

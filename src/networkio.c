@@ -7,155 +7,100 @@
 #include "networkio.h"
 #include "shutdown.h"
 
+/*
+ *
+ * message structure:
+ * [2 byte size][1 byte type][1 byte subtype][data]
+ */
+
 #define PORT 8888
-#define MAX_CONNECTIONS 16
-#define CONN_BUF_SZ 256
+#define QUEUE_DEPTH 16
+#define BUFFER_CNT QUEUE_DEPTH * 2
+#define BUFFER_SZ 1024
 
-// connection
-struct conn {
-	int socket;
-	struct sockaddr_in addr;
-	char addrstr[INET_ADDRSTRLEN];
-	char buffer[CONN_BUF_SZ];
-};
+static struct msghdr msghdr;
+static char recv_buffers[BUFFER_CNT * BUFFER_SZ];
 
-// connection manager
-struct connman {
-	int open_connections;
-	struct conn conns[MAX_CONNECTIONS];
-};
-
-static struct connman connman;
-static struct sockaddr_in addr;
-static socklen_t addr_sz;
-
-static void connman_initialize()
+static int submit_recvmsg_sqe(struct io_uring *ring, int socket)
 {
-	connman.open_connections = 0;
-	for (int i = 0; i < MAX_CONNECTIONS; i++) {
-		connman.conns[i].socket = -1;
+	struct io_uring_sqe *sqe;
+	sqe = io_uring_get_sqe(ring);
+	if (!sqe) {
+		fprintf(stderr, "submit_recvmsg_sqe(): "
+				"submission queue full!\n");
+		return -1;
 	}
-}
-
-static int connman_can_accept()
-{
-	return connman.open_connections < MAX_CONNECTIONS;
-}
-
-static struct conn *connman_accept_conn(int socket)
-{
-	for (int i = 0; i < MAX_CONNECTIONS; i++) {
-		if (connman.conns[i].socket < 0) {
-			connman.conns[i].socket = socket;
-			connman.conns[i].addr = addr;
-			connman.open_connections++;
-			inet_ntop(
-				AF_INET, 
-				&connman.conns[i].addr.sin_addr, 
-				connman.conns[i].addrstr,
-				INET_ADDRSTRLEN
-			);
-			return &connman.conns[i];
-		}
-	}
-	return NULL;
-}
-
-static void connman_close_connection(struct conn *conn)
-{
-	conn->socket = -1;
-	connman.open_connections--;
-}
-
-
-static void submit_recv_sqe(struct io_uring *ring, struct conn *conn)
-{
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-	io_uring_prep_recv(sqe, conn->socket, conn->buffer, CONN_BUF_SZ, 0);
-	io_uring_sqe_set_data(sqe, conn);
+	io_uring_prep_recvmsg_multishot(sqe, socket, &msghdr, 0);
+	sqe->flags |= IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 0;
 	io_uring_submit(ring);
+	return 0;
 }
 
-static void handle_recv_cqe(struct io_uring *ring, struct io_uring_cqe *cqe)
-{
-	// for now just print to stdout
-	struct conn *conn = (struct conn *)cqe->user_data;
-	if (cqe->res == -104) {
-		printf("%s(%i): messy close\n", conn->addrstr, conn->socket);
-		connman_close_connection(conn);
-		return;
-	} else if (cqe->res < 0) {
-		perror("recv()");
-		connman_close_connection(conn);
-		return;
-	} else if (cqe->res == 0) {
-		printf("%s(%i): close\n", conn->addrstr, conn->socket);
-		connman_close_connection(conn);
-		return;
-	} 
-	printf(
-		"%s(%i): recv %i bytes of data:\n", 
-		conn->addrstr, conn->socket, cqe->res
-	);
-	conn->buffer[cqe->res] = '\0';
-	printf("\t%s", conn->buffer);
-	submit_recv_sqe(ring, conn);
-}
-
-static void submit_accept_sqe(struct io_uring *ring, int socket)
-{
-	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-	struct sockaddr *sockaddr = (struct sockaddr *)&addr;
-	io_uring_prep_accept(sqe, socket, sockaddr, &addr_sz, 0);
-	io_uring_sqe_set_data(sqe, NULL);
-	io_uring_submit(ring);
-}
-
-static void handle_accept_cqe(
+static int handle_recvmsg_cqe(
 	struct io_uring *ring,
-	struct io_uring_cqe *cqe, 
-	int socket)
+	struct io_uring_buf_ring *buf_ring,
+	struct io_uring_cqe *cqe)
 {
-	//TODO: submit accept only when we know we have space
-	if (cqe->res >= 0 && connman_can_accept()) {
-		struct conn *conn = connman_accept_conn(cqe->res);
-		printf(
-			"accepted connection from %s(%i)\n", 
-			conn->addrstr, 
-			conn->socket
-		);
-		submit_recv_sqe(ring, conn);
-	}	// TODO: logging
-	submit_accept_sqe(ring, socket);
+	if (!(cqe->flags & IORING_CQE_F_BUFFER)) {
+		fprintf(stderr, "handle_recvmsg_cqe(): "
+				"cqe missing IORING_CQE_F_BUFFER flag\n");
+		return -1;
+	}
+
+	int rv = 0;
+	int bidx = cqe->flags >> 16;
+	struct io_uring_recvmsg_out *out;
+	char *buf = recv_buffers + (bidx * BUFFER_SZ);
+	out = io_uring_recvmsg_validate(buf, cqe->res, &msghdr);
+	if (!out) {
+		fprintf(stderr, "handle_recvmsg_cqe(): "
+				"message failed validation\n");
+		rv = -1;
+		goto recycle;
+	}
+	if (out->namelen > msghdr.msg_namelen) {
+		fprintf(stderr, "handle_recvmsg_cqe(): "
+				"truncated name\n");
+		rv = -1;
+		goto recycle;
+	}
+	if (out->flags & MSG_TRUNC)
+	{
+		fprintf(stderr, "handle_recvmsg_cqe(): "
+				"truncated message\n");
+		rv = -1;
+		goto recycle;
+	}
+
+	char name[INET_ADDRSTRLEN];
+	struct sockaddr_in *addr = io_uring_recvmsg_name(out);
+	inet_ntop(AF_INET, &addr->sin_addr, name, INET_ADDRSTRLEN);
+	int data_sz = io_uring_recvmsg_payload_length(out, cqe->res, &msghdr);
+	char *data = io_uring_recvmsg_payload(out, &msghdr);
+	data[data_sz] = '\0';
+
+	printf("recvmsg[%s(%i)]: %s\n", name, ntohs(addr->sin_port), data);
+
+recycle:
+	io_uring_buf_ring_add(buf_ring, buf, BUFFER_SZ, bidx, BUFFER_CNT-1,0);
+	io_uring_buf_ring_advance(buf_ring, 1);
+	return rv;
 }
 
-void *accept_recv_loop(void *arg)
+void *recvmsg_loop(void *arg)
 {
-	int s;
 	int res;
-	struct sockaddr_in addr;
-	struct io_uring ring;
-	struct io_uring_cqe *cqe;
 
-	addr_sz = sizeof(addr);
-	connman_initialize();
-
-	s = socket(PF_INET, SOCK_STREAM, 0);
+	// get a socket
+	int s = socket(PF_INET, SOCK_DGRAM, 0);
 	if (s < 0) {
 		perror("socket()");
-		graceful_shutdown();
-		return NULL;
+		goto shutdown;
 	}
 
-	res = 1;
-	res = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &res, sizeof(int));
-	if (res < 0) {
-		perror("setsockopt()");
-		close(s);
-		graceful_shutdown();
-		return NULL;
-	}
-
+	// bind the socket
+	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(PORT);
@@ -163,41 +108,97 @@ void *accept_recv_loop(void *arg)
 	res = bind(s, (struct sockaddr *)&addr, sizeof(addr));
 	if (res < 0) {
 		perror("bind()");
-		close(s);
-		graceful_shutdown();
-		return NULL;
+		goto close_socket;
 	}
 
-	res = listen(s, MAX_CONNECTIONS);
+	// initialize our io_uring
+	struct io_uring ring;
+	res = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
 	if (res < 0) {
-		perror("listen()");
-		close(s);
-		graceful_shutdown();
-		return NULL;
+		perror("io_uring_queue_init()");
+		goto close_socket;
 	}
 
-	io_uring_queue_init(MAX_CONNECTIONS + 1, &ring, 0);
+	// initialize our buffer ring
+	struct io_uring_buf_ring *buf_ring;
+	res = posix_memalign(
+		(void **)&buf_ring, 
+		sysconf(_SC_PAGESIZE), 
+		sizeof(*buf_ring));
+	if (res < 0) {
+		perror("posix_memalign()");
+		goto exit_uring_queue;
+	}
 
-	submit_accept_sqe(&ring, s);
+	// register our buffer ring with our io ring
+	struct io_uring_buf_reg buffer_reg;
+	buffer_reg.ring_addr = (unsigned long)buf_ring;
+	buffer_reg.ring_entries = BUFFER_CNT;
+	buffer_reg.bgid = 0;
+	res = io_uring_register_buf_ring(&ring, &buffer_reg, 0);
+	if (res < 0) {
+		perror("io_uring_register_buf_ring()");
+		goto dealloc_buf_ring;
+	}
+
+	// add buffers to our buffer ring 
+	io_uring_buf_ring_init(buf_ring);
+	int mask = io_uring_buf_ring_mask(BUFFER_CNT);
+	for (int i = 0; i < BUFFER_CNT; i++) {
+		void *buffer = recv_buffers + (i * BUFFER_SZ);
+		io_uring_buf_ring_add(buf_ring, buffer, BUFFER_SZ, i, mask, i);
+	}
+	io_uring_buf_ring_advance(buf_ring, BUFFER_CNT);
+
+	// add recvmsg multishot sqe (and "initialize" our msghdr)
+	msghdr.msg_namelen = sizeof(struct sockaddr_in);
+	res = submit_recvmsg_sqe(&ring, s);
+	if (res < 0) {
+		fprintf(stderr, "idk how its full during init but whatever\n");
+		goto dealloc_buf_ring;
+	}
+
+	// pump recvmsg loop
+	struct io_uring_cqe *cqe;
 	while(1) {
 		res = io_uring_wait_cqe(&ring, &cqe);
 		if (res < 0) {
+			// the attempt to dequeue an cqe failed
 			perror("io_uring_wait_cqe()");
-			close(s);
-			graceful_shutdown();
-			return NULL;
+			break;
 		}
-
-		// we don't attach user data for accept sqe
-		if (cqe->user_data) {
-			handle_recv_cqe(&ring, cqe);
-		} else {
-			handle_accept_cqe(&ring, cqe, s);
+		if (cqe->res < 0) {
+			// our request failed
+			// TODO: don't shutdown here
+			errno = -cqe->res;
+			perror("recvmsg()");
+			break;
 		}
-
+		res = handle_recvmsg_cqe(&ring, buf_ring, cqe);
+		if (res < 0) {
+			// TODO: don't shutdown here
+			printf("handle_recvmsg_cqe() returned: %i", res);
+			break;
+		}
 		io_uring_cqe_seen(&ring, cqe);
+
+		if (!(cqe->flags & IORING_CQE_F_MORE)) {
+			// for some reason, the multishot stopped
+			submit_recvmsg_sqe(&ring, s);
+		}
 	}
+
+dealloc_buf_ring:
+	free(buf_ring);
+
+exit_uring_queue:
+	io_uring_queue_exit(&ring);
+
+close_socket:
+	close(s);
+
+shutdown:
+	graceful_shutdown();
 
 	return NULL;
 }
-
