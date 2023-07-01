@@ -7,12 +7,6 @@
 #include "networkio.h"
 #include "shutdown.h"
 
-/*
- *
- * message structure:
- * [2 byte size][1 byte type][1 byte subtype][data]
- */
-
 #define PORT 8888
 #define QUEUE_DEPTH 16
 #define BUFFER_CNT QUEUE_DEPTH * 2
@@ -73,14 +67,19 @@ static int handle_recvmsg_cqe(
 		goto recycle;
 	}
 
-	char name[INET_ADDRSTRLEN];
-	struct sockaddr_in *addr = io_uring_recvmsg_name(out);
-	inet_ntop(AF_INET, &addr->sin_addr, name, INET_ADDRSTRLEN);
-	int data_sz = io_uring_recvmsg_payload_length(out, cqe->res, &msghdr);
-	char *data = io_uring_recvmsg_payload(out, &msghdr);
-	data[data_sz] = '\0';
+	printf("received data :)\n");
 
-	printf("recvmsg[%s(%i)]: %s\n", name, ntohs(addr->sin_port), data);
+	/*
+	// copy the buffer and send to worker pool
+	char *out_copy = malloc(cqe->res);
+	if (!out_copy) {
+		perror("handle_recvmsg_cqe(): malloc()");
+		rv = -1;
+		goto recycle;
+	}
+	*/
+
+
 
 recycle:
 	io_uring_buf_ring_add(buf_ring, buf, BUFFER_SZ, bidx, BUFFER_CNT-1,0);
@@ -91,6 +90,12 @@ recycle:
 void *recvmsg_loop(void *arg)
 {
 	int res;
+
+	// block sigint on the main thread (for some reason? IBM told me to)
+	sigset_t signal_set;
+	sigemptyset(&signal_set);
+	sigaddset(&signal_set, SIGINT);
+	pthread_sigmask(SIG_BLOCK, &signal_set, NULL);
 
 	// get a socket
 	int s = socket(PF_INET, SOCK_DGRAM, 0);
@@ -124,7 +129,7 @@ void *recvmsg_loop(void *arg)
 	res = posix_memalign(
 		(void **)&buf_ring, 
 		sysconf(_SC_PAGESIZE), 
-		sizeof(*buf_ring));
+		BUFFER_CNT * sizeof(*buf_ring));
 	if (res < 0) {
 		perror("posix_memalign()");
 		goto exit_uring_queue;
@@ -160,10 +165,15 @@ void *recvmsg_loop(void *arg)
 
 	// pump recvmsg loop
 	struct io_uring_cqe *cqe;
-	while(1) {
-		res = io_uring_wait_cqe(&ring, &cqe);
+	struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+	while(!shutdown_flag) {
+		res = io_uring_wait_cqe_timeout(&ring, &cqe, &ts);
+		if (res == -ETIME) {
+			continue;
+		}
 		if (res < 0) {
-			// the attempt to dequeue an cqe failed
+			// the call to dequeue an cqe failed
+			errno = -res;
 			perror("io_uring_wait_cqe()");
 			break;
 		}
@@ -174,10 +184,11 @@ void *recvmsg_loop(void *arg)
 			perror("recvmsg()");
 			break;
 		}
+
 		res = handle_recvmsg_cqe(&ring, buf_ring, cqe);
 		if (res < 0) {
 			// TODO: don't shutdown here
-			printf("handle_recvmsg_cqe() returned: %i", res);
+			printf("handle_recvmsg_cqe() returned: %i\n", res);
 			break;
 		}
 		io_uring_cqe_seen(&ring, cqe);

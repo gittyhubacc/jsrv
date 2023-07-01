@@ -1,5 +1,5 @@
 CC := gcc
-CFLAGS := -g
+CFLAGS := -g -O0
 LDFLAGS := -luring -lpthread
 
 BIN_NAME := jsrv

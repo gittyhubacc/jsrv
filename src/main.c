@@ -9,9 +9,33 @@ int shutdown_flag;
 pthread_cond_t shutdown_cond;
 pthread_mutex_t shutdown_mutex;
 
-void signal_handler(int s)
+void graceful_shutdown()
 {
+	pthread_mutex_lock(&shutdown_mutex);
+	shutdown_flag = 1;
+	pthread_mutex_unlock(&shutdown_mutex);
+	pthread_cond_signal(&shutdown_cond);
+}
+
+void *signal_handler(void *arg)
+{
+	int sig, res;
+	sigset_t signal_set;
+	sigfillset(&signal_set);
+	pthread_sigmask(SIG_BLOCK, &signal_set, NULL);
+
+	while (1) {
+		res = sigwait(&signal_set, &sig);
+		if (res < 0) {
+			printf("sigwait(): returned %i\n", res);
+			break;
+		}
+		printf("signal_handler(): received signal %d\n", sig);
+		if (sig == SIGINT) break;
+	}
+
 	graceful_shutdown();
+	return NULL;
 }
 
 int main(int argc, char **argv)
@@ -19,18 +43,27 @@ int main(int argc, char **argv)
 	// pre-threaded initialization
 	shutdown_flag = 0;
 
-	int res;
-	pthread_t accept_read_th;
+	// block sigint on the main thread (for some reason? IBM told me to)
+	sigset_t signal_set;
+	sigemptyset(&signal_set);
+	sigaddset(&signal_set, SIGINT);
+	pthread_sigmask(SIG_BLOCK, &signal_set, NULL);
 
+	// initialize threads n at
+	pthread_t signal_thread;
+	pthread_t recvmsg_thread;
 	pthread_mutex_init(&shutdown_mutex, NULL);
 	pthread_cond_init(&shutdown_cond, NULL);
 
-	signal(SIGINT, signal_handler);
-
-	res = pthread_create(&accept_read_th, NULL, recvmsg_loop, NULL);
+	int res = pthread_create(&signal_thread, NULL, signal_handler, NULL);
 	if (res < 0) {
 		perror("pthread_create()");
-		graceful_shutdown();
+		goto destroy_sync;
+	}
+	res = pthread_create(&recvmsg_thread, NULL, recvmsg_loop, NULL);
+	if (res < 0) {
+		perror("pthread_create()");
+		goto destroy_sync;
 	}
 
 	pthread_mutex_lock(&shutdown_mutex);
@@ -41,7 +74,14 @@ int main(int argc, char **argv)
 
 	printf("shutting down...\n");
 
-	pthread_cancel(accept_read_th);
+destroy_threads:
+	pthread_cancel(signal_thread);
+	pthread_join(signal_thread, NULL);
+	pthread_join(recvmsg_thread, NULL);
+
+destroy_sync:
+	pthread_cond_destroy(&shutdown_cond);
+	pthread_mutex_destroy(&shutdown_mutex);
 
 	return EXIT_SUCCESS;
 }
