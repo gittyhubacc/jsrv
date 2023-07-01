@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include "networkio.h"
 #include "shutdown.h"
+#include "worker.h"
 
 #define PORT 8888
 #define QUEUE_DEPTH 16
@@ -67,19 +68,21 @@ static int handle_recvmsg_cqe(
 		goto recycle;
 	}
 
-	printf("received data :)\n");
-
-	/*
 	// copy the buffer and send to worker pool
-	char *out_copy = malloc(cqe->res);
-	if (!out_copy) {
+	struct workdata *data = malloc(sizeof(*data));
+	if (!data) {
 		perror("handle_recvmsg_cqe(): malloc()");
 		rv = -1;
 		goto recycle;
 	}
-	*/
 
+	char *payload = io_uring_recvmsg_payload(out, &msghdr);
+	data->addr = *((struct sockaddr_in*)io_uring_recvmsg_name(out));
+	data->len = io_uring_recvmsg_payload_length(out, cqe->res, &msghdr);
+	memcpy(&data->payload, payload, data->len);
 
+	workqueue_push(&workqueue, data);
+	printf("pushed to work queue\n");
 
 recycle:
 	io_uring_buf_ring_add(buf_ring, buf, BUFFER_SZ, bidx, BUFFER_CNT-1,0);
@@ -94,7 +97,7 @@ void *recvmsg_loop(void *arg)
 	// block sigint on the main thread (for some reason? IBM told me to)
 	sigset_t signal_set;
 	sigemptyset(&signal_set);
-	sigaddset(&signal_set, SIGINT);
+	sigfillset(&signal_set);
 	pthread_sigmask(SIG_BLOCK, &signal_set, NULL);
 
 	// get a socket
@@ -117,6 +120,7 @@ void *recvmsg_loop(void *arg)
 	}
 
 	// initialize our io_uring
+
 	struct io_uring ring;
 	res = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
 	if (res < 0) {
@@ -134,7 +138,6 @@ void *recvmsg_loop(void *arg)
 		perror("posix_memalign()");
 		goto exit_uring_queue;
 	}
-
 	// register our buffer ring with our io ring
 	struct io_uring_buf_reg buffer_reg;
 	buffer_reg.ring_addr = (unsigned long)buf_ring;
@@ -142,6 +145,7 @@ void *recvmsg_loop(void *arg)
 	buffer_reg.bgid = 0;
 	res = io_uring_register_buf_ring(&ring, &buffer_reg, 0);
 	if (res < 0) {
+		errno = -res;
 		perror("io_uring_register_buf_ring()");
 		goto dealloc_buf_ring;
 	}
@@ -166,7 +170,10 @@ void *recvmsg_loop(void *arg)
 	// pump recvmsg loop
 	struct io_uring_cqe *cqe;
 	struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-	while(!shutdown_flag) {
+
+	int shutdown_copy = 0;
+
+	while(!should_shutdown()) {
 		res = io_uring_wait_cqe_timeout(&ring, &cqe, &ts);
 		if (res == -ETIME) {
 			continue;

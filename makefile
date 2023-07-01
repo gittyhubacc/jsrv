@@ -21,6 +21,8 @@ $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@ 
 
-.PHONY: clean
+.PHONY: clean test
 clean:
 	rm -rf $(BIN_DIR) $(OBJ_DIR)
+test: $(BIN_DIR)/$(BIN_NAME)
+	valgrind ./$(BIN_DIR)/$(BIN_NAME)

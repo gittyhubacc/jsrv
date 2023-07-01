@@ -3,10 +3,7 @@
 
 #include <pthread.h>
 
-extern int shutdown_flag;
-extern pthread_cond_t shutdown_cond;
-extern pthread_mutex_t shutdown_mutex;
-
+int should_shutdown();
 void graceful_shutdown();
 
 #endif
