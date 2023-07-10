@@ -81,9 +81,7 @@ static int handle_recvmsg_cqe(
 	data->len = io_uring_recvmsg_payload_length(out, cqe->res, &msghdr);
 	memcpy(&data->payload, payload, data->len);
 
-	workqueue_push(&workqueue, data);
-	printf("pushed to work queue\n");
-
+	rv = queue_push(&workqueue, data);
 recycle:
 	io_uring_buf_ring_add(buf_ring, buf, BUFFER_SZ, bidx, BUFFER_CNT-1,0);
 	io_uring_buf_ring_advance(buf_ring, 1);
@@ -120,7 +118,6 @@ void *recvmsg_loop(void *arg)
 	}
 
 	// initialize our io_uring
-
 	struct io_uring ring;
 	res = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
 	if (res < 0) {
@@ -138,6 +135,7 @@ void *recvmsg_loop(void *arg)
 		perror("posix_memalign()");
 		goto exit_uring_queue;
 	}
+
 	// register our buffer ring with our io ring
 	struct io_uring_buf_reg buffer_reg;
 	buffer_reg.ring_addr = (unsigned long)buf_ring;

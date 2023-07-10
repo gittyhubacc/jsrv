@@ -22,7 +22,7 @@ void graceful_shutdown()
 	pthread_mutex_lock(&shutdown_mutex);
 	shutdown_flag = 1;
 	pthread_mutex_unlock(&shutdown_mutex);
-	pthread_cond_signal(&shutdown_cond);
+	pthread_cond_broadcast(&shutdown_cond);
 }
 
 void *signal_handler(void *arg)
@@ -64,7 +64,7 @@ int main(int argc, char **argv)
 	pthread_t wrk_threads[WORKER_CNT];
 	pthread_mutex_init(&shutdown_mutex, NULL);
 	pthread_cond_init(&shutdown_cond, NULL);
-	workqueue_init(&workqueue);
+	queue_init(&workqueue);
 
 	int res = pthread_create(&signal_thread, NULL, signal_handler, NULL);
 	if (res < 0) {
@@ -102,7 +102,7 @@ destroy_threads:
 	}
 
 destroy_sync:
-	workqueue_destroy(&workqueue);
+	queue_destroy(&workqueue);
 	pthread_cond_destroy(&shutdown_cond);
 	pthread_mutex_destroy(&shutdown_mutex);
 

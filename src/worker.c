@@ -2,79 +2,62 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
+#include <lua.h>
 #include "shutdown.h"
 #include "worker.h"
+#include "jsmn.h"
 
-struct workqueue workqueue;
+struct queue workqueue;
 
-void workqueue_init(struct workqueue *queue)
+#define MAX_TOKENS 256
+#define HEADER_SZ 4
+static void json_operation(struct workdata *msg)
 {
-	queue->size = 0;
-	queue->head = NULL;
-	pthread_mutex_init(&queue->mutex, 0);
-	pthread_cond_init(&queue->cond, 0);
-}
-
-int workqueue_push(struct workqueue *queue, struct workdata *out)
-{
-	pthread_mutex_lock(&queue->mutex);
-
-	struct workqueueitem *item = malloc(sizeof(*item));
-	if (!item) {
-		perror("workqueue_push(): malloc()");
-		pthread_mutex_unlock(&queue->mutex);
-		return -1;
+	// read how many tokens are in the payload
+	int tok_cnt = ntohs(((short int *)msg->payload)[1]);
+	if (tok_cnt <= 0 || tok_cnt > MAX_TOKENS) {
+		fprintf(stderr, "bad tok_cnt: %i\n", tok_cnt);
+		return;
 	}
 
-	item->next = NULL;
-	item->data = out;
+	jsmn_parser p;
+	jsmntok_t tokens[tok_cnt];
+	char *json_str = msg->payload + HEADER_SZ;
+	size_t json_sz = msg->len - HEADER_SZ;
 
-	struct workqueueitem **current = &queue->head;
-	while (*current) current = &(*current)->next;
-	*current = item;
-
-	queue->size++;
-
-	pthread_mutex_unlock(&queue->mutex);
-	pthread_cond_signal(&queue->cond);
-
-	return 0;
-}
-
-struct workdata *workqueue_pop(struct workqueue *queue)
-{
-	pthread_mutex_lock(&queue->mutex);
-
-	while (queue->size < 1) {
-		pthread_cond_wait(&queue->cond, &queue->mutex);
+	jsmn_init(&p);
+	int res = jsmn_parse(&p, json_str, json_sz, tokens, tok_cnt);
+	if (res < 0) switch (res) {
+	case JSMN_ERROR_NOMEM:
+		fprintf(stderr, "jsmn_parse(): %i: "
+				"message had incorrect token count\n", res);
+		return;
+	case JSMN_ERROR_PART:
+		fprintf(stderr, "jsmn_parse(): %i: "
+				"message had incomplete json\n", res);
+		return;
+	case JSMN_ERROR_INVAL:
+		fprintf(stderr, "jsmn_parse(): %i: "
+				"message had invalid json\n", res);
+		return;
+	default:
+		fprintf(stderr, "jsmn_parse(): %i: "
+				"something bad happened\n", res);
+		return;
 	}
 
-	struct workqueueitem *item = queue->head;
-	struct workdata *out = item->data;
-	queue->head = item->next;
-	queue->size--;
-
-	pthread_mutex_unlock(&queue->mutex);
-
-	free(item);
-
-	return out;
+	printf("got %i tokens\n\t%s\n", res, json_str);
 }
+#undef HEADER_SZ
+#undef MAX_TOKENS
 
-void workqueue_destroy(struct workqueue *queue)
-{
-	pthread_mutex_destroy(&queue->mutex);
-	pthread_cond_destroy(&queue->cond);
-}
-
-static void print_mesg(struct workdata *data)
-{
-	char name[INET_ADDRSTRLEN];
-	inet_ntop(AF_INET, &data->addr.sin_addr, name, INET_ADDRSTRLEN);
-	data->payload[data->len] = '\0';
-	printf("[%s](%d): %s\n", name, ntohs(data->addr.sin_port), data->payload);
-}
+#define OPERATION_CNT 1
+typedef void (*operation_t)(struct workdata *msg);
+static operation_t operations[OPERATION_CNT] = {
+	json_operation
+};
 
 static void worker_cleanup(void *arg)
 {
@@ -88,13 +71,20 @@ void *worker_loop(void *arg)
 	sigfillset(&signal_set);
 	pthread_sigmask(SIG_BLOCK, &signal_set, NULL);
 
+	int opcode;
+	struct workdata *message;
 	pthread_cleanup_push(worker_cleanup, NULL);
-	struct workdata *out;
 	while (!should_shutdown()) {
-		out = workqueue_pop(&workqueue);
-		print_mesg(out);
-		free(out);
+		message = (struct workdata *)queue_pop(&workqueue);
+		opcode = ntohs(*(short int *)message->payload);
+		if (opcode < 0 || opcode >= OPERATION_CNT) {
+			fprintf(stderr, "bad opcode: %i\n", opcode);
+		} else {
+			operations[opcode](message);
+		}
+		free(message);
 	}
 	pthread_cleanup_pop(1);
 	return NULL;
 }
+#undef OPERATION_CNT
