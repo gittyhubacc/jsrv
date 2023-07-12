@@ -17,7 +17,8 @@ struct queue {
 
 void queue_init(struct queue *q);
 int queue_push(struct queue *q, void *data);
-struct data *queue_pop(struct queue *q);
+void *queue_peek(struct queue *q);
+void *queue_pop(struct queue *q);
 void queue_destroy(struct queue *q);
 
 #endif

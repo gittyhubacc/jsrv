@@ -69,19 +69,19 @@ static int handle_recvmsg_cqe(
 	}
 
 	// copy the buffer and send to worker pool
-	struct workdata *data = malloc(sizeof(*data));
-	if (!data) {
+	struct work_msg *msg = malloc(sizeof(*msg));
+	if (!msg) {
 		perror("handle_recvmsg_cqe(): malloc()");
 		rv = -1;
 		goto recycle;
 	}
 
 	char *payload = io_uring_recvmsg_payload(out, &msghdr);
-	data->addr = *((struct sockaddr_in*)io_uring_recvmsg_name(out));
-	data->len = io_uring_recvmsg_payload_length(out, cqe->res, &msghdr);
-	memcpy(&data->payload, payload, data->len);
+	msg->addr = *((struct sockaddr_in*)io_uring_recvmsg_name(out));
+	msg->len = io_uring_recvmsg_payload_length(out, cqe->res, &msghdr);
+	memcpy(&msg->payload, payload, msg->len);
 
-	rv = queue_push(&workqueue, data);
+	rv = queue_push(&workqueue, msg);
 recycle:
 	io_uring_buf_ring_add(buf_ring, buf, BUFFER_SZ, bidx, BUFFER_CNT-1,0);
 	io_uring_buf_ring_advance(buf_ring, 1);

@@ -1,6 +1,6 @@
 CC := gcc
 CFLAGS := -g -O0
-LDFLAGS := -luring -lpthread
+LDFLAGS := -luring -lpthread -llua
 
 BIN_NAME := jsrv
 

@@ -10,7 +10,7 @@
 // need to keep this in sync with BUFFER_SZ in networkio.c
 #define BUFFER_SZ 1024
 
-struct workdata {
+struct work_msg {
 	int len;
 	char payload[BUFFER_SZ];
 	struct sockaddr_in addr;

@@ -3,8 +3,9 @@
 #include <signal.h>
 #include <pthread.h>
 #include "networkio.h"
-#include "worker.h"
 #include "shutdown.h"
+#include "worker.h"
+#include "game.h"
 
 #define WORKER_CNT 4
 
@@ -49,23 +50,25 @@ void *signal_handler(void *arg)
 
 int main(int argc, char **argv)
 {
-	// pre-threaded initialization
-	shutdown_flag = 0;
-
-	// block sigint on the main thread (for some reason? IBM told me to)
+	// block signals
 	sigset_t signal_set;
-	sigemptyset(&signal_set);
 	sigfillset(&signal_set);
 	pthread_sigmask(SIG_BLOCK, &signal_set, NULL);
 
-	// initialize threads n at
+	// pre-thread initialization
+	pthread_t game_thread;
 	pthread_t signal_thread;
 	pthread_t recvmsg_thread;
 	pthread_t wrk_threads[WORKER_CNT];
+
+	shutdown_flag = 0;
 	pthread_mutex_init(&shutdown_mutex, NULL);
 	pthread_cond_init(&shutdown_cond, NULL);
-	queue_init(&workqueue);
 
+	queue_init(&workqueue);
+	game_loop_init();
+
+	// start threads
 	int res = pthread_create(&signal_thread, NULL, signal_handler, NULL);
 	if (res < 0) {
 		perror("pthread_create()");
@@ -83,6 +86,11 @@ int main(int argc, char **argv)
 			goto destroy_sync;
 		}
 	}
+	res = pthread_create(&game_thread, NULL, game_loop, NULL);
+	if (res < 0) {
+		perror("pthread_create()");
+		goto destroy_sync;
+	}
 
 	pthread_mutex_lock(&shutdown_mutex);
 	while (!shutdown_flag) {
@@ -92,14 +100,19 @@ int main(int argc, char **argv)
 
 	printf("shutting down...\n");
 
-destroy_threads:
 	pthread_cancel(signal_thread);
+	pthread_cancel(game_thread);
 	pthread_join(signal_thread, NULL);
+	pthread_join(game_thread, NULL);
+
 	pthread_join(recvmsg_thread, NULL);
+
 	for (int i = 0; i < WORKER_CNT; i++) {
 		pthread_cancel(wrk_threads[i]);
 		pthread_join(wrk_threads[i], NULL);
 	}
+
+	game_loop_destroy();
 
 destroy_sync:
 	queue_destroy(&workqueue);

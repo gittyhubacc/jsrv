@@ -41,7 +41,18 @@ int queue_push(struct queue *queue, void *data)
 	return 0;
 }
 
-struct data *queue_pop(struct queue *queue)
+void *queue_peek(struct queue *queue)
+{
+	void *rv = NULL;
+	pthread_mutex_lock(&queue->mutex);
+	if (queue->head) {
+		rv = queue->head->data;
+	}
+	pthread_mutex_unlock(&queue->mutex);
+	return rv;
+}
+
+void *queue_pop(struct queue *queue)
 {
 	pthread_mutex_lock(&queue->mutex);
 
